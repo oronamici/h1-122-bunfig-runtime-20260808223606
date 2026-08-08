@@ -1,0 +1,292 @@
+name: H1 122 Bunfig MCP Runtime Validation
+
+on:
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: Pull request number to validate
+        required: true
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      TESTED_ACTION_REF: be7b93b1907a4abad570368f3c74b6fe3807510b
+      H1_MARKER: H1_SAFE_BUNFIG_PRELOAD_MARKER_122
+      H1_RUNTIME_PR_NUMBER: ${{ inputs.pr_number }}
+      H1_PRELOAD_OBSERVED_PATH: ${{ runner.temp }}/h1-preload-observed-122.json
+      H1_FAKE_CLAUDE_OBSERVED_PATH: ${{ runner.temp }}/h1-fake-claude-observed-122.json
+    steps:
+      - name: Read pull request metadata
+        id: pr
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+        run: |
+          set -euo pipefail
+          gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}" > "$RUNNER_TEMP/pr.json"
+
+          base_repo="$(jq -r '.base.repo.full_name' "$RUNNER_TEMP/pr.json")"
+          head_repo="$(jq -r '.head.repo.full_name' "$RUNNER_TEMP/pr.json")"
+          head_ref="$(jq -r '.head.ref' "$RUNNER_TEMP/pr.json")"
+          head_sha="$(jq -r '.head.sha' "$RUNNER_TEMP/pr.json")"
+          pr_author="$(jq -r '.user.login' "$RUNNER_TEMP/pr.json")"
+          author_association="$(jq -r '.author_association' "$RUNNER_TEMP/pr.json")"
+
+          {
+            echo "base_repo=${base_repo}"
+            echo "head_repo=${head_repo}"
+            echo "head_ref=${head_ref}"
+            echo "head_sha=${head_sha}"
+            echo "pr_author=${pr_author}"
+            echo "author_association=${author_association}"
+          } >> "$GITHUB_OUTPUT"
+
+          test "$base_repo" = "$GITHUB_REPOSITORY"
+          test "$head_repo" != "$base_repo"
+          test "$author_association" != "OWNER"
+          test "$author_association" != "MEMBER"
+          test "$author_association" != "COLLABORATOR"
+
+      - name: Checkout pull request head
+        uses: actions/checkout@v4
+        with:
+          ref: refs/pull/${{ inputs.pr_number }}/head
+          fetch-depth: 0
+
+      - name: Validate checkout and PR-controlled files
+        id: checkout
+        shell: bash
+        run: |
+          set -euo pipefail
+          checked_out_sha="$(git rev-parse HEAD)"
+          echo "checked_out_sha=${checked_out_sha}" >> "$GITHUB_OUTPUT"
+          test "$checked_out_sha" = "${{ steps.pr.outputs.head_sha }}"
+          test -f bunfig.toml
+          test -f h1-preload-122.ts
+          echo "bunfig_blob_sha=$(git rev-parse HEAD:bunfig.toml)" >> "$GITHUB_OUTPUT"
+          echo "preload_blob_sha=$(git rev-parse HEAD:h1-preload-122.ts)" >> "$GITHUB_OUTPUT"
+
+      - name: Create fake Claude executable
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/fake-claude" <<'EOF'
+          #!/usr/bin/env node
+          const fs = require("fs");
+          const cp = require("child_process");
+          const path = require("path");
+
+          const observedPath =
+            process.env.H1_FAKE_CLAUDE_OBSERVED_PATH ||
+            path.join(process.env.RUNNER_TEMP || "/tmp", "h1-fake-claude-observed-122.json");
+
+          function parseMcpConfig(argv) {
+            for (let i = 0; i < argv.length; i++) {
+              if (argv[i] === "--mcp-config" && argv[i + 1]) {
+                try {
+                  return JSON.parse(argv[i + 1]);
+                } catch (err) {
+                  return { parse_error: String(err), raw_prefix: String(argv[i + 1]).slice(0, 120) };
+                }
+              }
+            }
+            return null;
+          }
+
+          const mcpConfig = parseMcpConfig(process.argv.slice(2));
+          const githubComment = mcpConfig && mcpConfig.mcpServers && mcpConfig.mcpServers.github_comment;
+          const observed = {
+            fake_claude_used: true,
+            anthropic_production_requests: 0,
+            argv_contains_mcp_config: Boolean(mcpConfig),
+            github_comment_server_present: Boolean(githubComment),
+            github_comment_command: githubComment ? githubComment.command : null,
+            github_comment_args: githubComment ? githubComment.args : null,
+            github_comment_env_has_github_token: Boolean(githubComment && githubComment.env && githubComment.env.GITHUB_TOKEN),
+            cwd: process.cwd(),
+            server_exit_status: null,
+            server_exit_signal: null
+          };
+
+          if (githubComment && githubComment.command && Array.isArray(githubComment.args)) {
+            const childEnv = { ...process.env, ...(githubComment.env || {}) };
+            const child = cp.spawnSync(githubComment.command, githubComment.args, {
+              cwd: process.cwd(),
+              env: childEnv,
+              encoding: "utf8",
+              timeout: 8000,
+              killSignal: "SIGTERM",
+              maxBuffer: 1024 * 1024
+            });
+            observed.server_exit_status = child.status;
+            observed.server_exit_signal = child.signal;
+            observed.server_stdout_marker_present = (child.stdout || "").includes(process.env.H1_MARKER || "H1_SAFE_BUNFIG_PRELOAD_MARKER_122");
+            observed.server_stderr_marker_present = (child.stderr || "").includes(process.env.H1_MARKER || "H1_SAFE_BUNFIG_PRELOAD_MARKER_122");
+          }
+
+          fs.writeFileSync(observedPath, JSON.stringify(observed, null, 2));
+
+          console.log(JSON.stringify({
+            type: "system",
+            subtype: "init",
+            apiKeySource: "none",
+            claude_code_version: "h1-fake-122",
+            cwd: process.cwd(),
+            tools: [],
+            mcp_servers: githubComment ? [{ name: "github_comment", status: "connected" }] : [],
+            model: "fake",
+            permissionMode: "default",
+            slash_commands: [],
+            output_style: "default",
+            skills: [],
+            plugins: [],
+            uuid: "00000000-0000-4000-8000-000000000001",
+            session_id: "00000000-0000-4000-8000-000000000122"
+          }));
+          console.log(JSON.stringify({
+            type: "result",
+            subtype: "success",
+            duration_ms: 1,
+            duration_api_ms: 0,
+            is_error: false,
+            num_turns: 1,
+            result: "H1 fake Claude completed without Anthropic API calls",
+            stop_reason: "end_turn",
+            total_cost_usd: 0,
+            usage: {
+              input_tokens: 0,
+              cache_creation_input_tokens: 0,
+              cache_read_input_tokens: 0,
+              output_tokens: 0,
+              server_tool_use: { web_search_requests: 0 },
+              service_tier: "standard"
+            },
+            modelUsage: {},
+            permission_denials: [],
+            uuid: "00000000-0000-4000-8000-000000000002",
+            session_id: "00000000-0000-4000-8000-000000000122"
+          }));
+          EOF
+          sed -i 's/^          //' "$RUNNER_TEMP/fake-claude"
+          chmod +x "$RUNNER_TEMP/fake-claude"
+
+      - name: Run affected claude-code-action with fake Claude
+        id: claude
+        uses: anthropics/claude-code-action@be7b93b1907a4abad570368f3c74b6fe3807510b
+        env:
+          H1_RUNTIME_PR_NUMBER: ${{ inputs.pr_number }}
+          H1_PRELOAD_OBSERVED_PATH: ${{ env.H1_PRELOAD_OBSERVED_PATH }}
+          H1_FAKE_CLAUDE_OBSERVED_PATH: ${{ env.H1_FAKE_CLAUDE_OBSERVED_PATH }}
+          H1_MARKER: ${{ env.H1_MARKER }}
+        with:
+          github_token: ${{ github.token }}
+          anthropic_api_key: H1_DUMMY_NOT_USED_122
+          path_to_claude_code_executable: ${{ runner.temp }}/fake-claude
+          prompt: H1 runtime validation. The fake Claude executable handles MCP startup and exits without calling Anthropic.
+          claude_args: --allowedTools mcp__github_comment__update_claude_comment
+
+      - name: Write runtime observed output
+        if: always()
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+        run: |
+          set -euo pipefail
+
+          fake_json='{}'
+          if [[ -f "$H1_FAKE_CLAUDE_OBSERVED_PATH" ]]; then
+            fake_json="$(cat "$H1_FAKE_CLAUDE_OBSERVED_PATH")"
+          fi
+
+          preload_json='{}'
+          if [[ -f "$H1_PRELOAD_OBSERVED_PATH" ]]; then
+            preload_json="$(cat "$H1_PRELOAD_OBSERVED_PATH")"
+          fi
+
+          gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}" > pr-metadata-122.json
+          gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" > run-metadata-122.json
+
+          jq -n \
+            --arg base_repo "${{ steps.pr.outputs.base_repo }}" \
+            --arg head_repo "${{ steps.pr.outputs.head_repo }}" \
+            --arg pr_author "${{ steps.pr.outputs.pr_author }}" \
+            --arg author_association "${{ steps.pr.outputs.author_association }}" \
+            --arg dispatch_actor "${{ github.actor }}" \
+            --arg event_name "${{ github.event_name }}" \
+            --arg tested_action_ref "$TESTED_ACTION_REF" \
+            --arg checked_out_sha "${{ steps.checkout.outputs.checked_out_sha }}" \
+            --arg pr_head_sha "${{ steps.pr.outputs.head_sha }}" \
+            --arg bunfig_blob_sha "${{ steps.checkout.outputs.bunfig_blob_sha }}" \
+            --arg preload_blob_sha "${{ steps.checkout.outputs.preload_blob_sha }}" \
+            --argjson fake "$fake_json" \
+            --argjson preload "$preload_json" \
+            '{
+              github_actions_runtime_validation: {
+                researcher_owned_disposable_repo: true,
+                base_repo_disposable: true,
+                fork_pr_used: ($base_repo != $head_repo),
+                fork_author_is_not_base_repo_collaborator: ($author_association != "OWNER" and $author_association != "MEMBER" and $author_association != "COLLABORATOR"),
+                base_repo: $base_repo,
+                head_repo: $head_repo,
+                pr_author: $pr_author,
+                author_association: $author_association,
+                maintainer_dispatch_actor: $dispatch_actor,
+                workflow_event: $event_name,
+                checkout_sha_equals_pr_head_sha: ($checked_out_sha == $pr_head_sha),
+                checked_out_sha: $checked_out_sha,
+                pr_head_sha: $pr_head_sha,
+                pr_controlled_bunfig_present: true,
+                pr_controlled_bunfig_blob_sha: $bunfig_blob_sha,
+                pr_controlled_preload_blob_sha: $preload_blob_sha,
+                tested_action_ref: $tested_action_ref,
+                exact_action_commit_used: true,
+                used_fake_claude_to_avoid_anthropic_api: ($fake.fake_claude_used == true),
+                anthropic_production_requests: 0,
+                action_generated_github_comment_mcp_server: ($fake.github_comment_server_present == true),
+                action_generated_mcp_command: $fake.github_comment_command,
+                action_generated_mcp_args: $fake.github_comment_args,
+                mcp_env_had_github_token: ($fake.github_comment_env_has_github_token == true),
+                pr_controlled_bunfig_preload_executed: ($preload.preload_executed == true),
+                preload_saw_github_token_env: ($preload.github_token_present == true),
+                safe_marker_comment_created: ($preload.comment_created == true),
+                marker_comment_url: ($preload.comment_url // null),
+                marker_comment_author: ($preload.comment_author // null),
+                real_tokens_printed: false,
+                real_tokens_persisted: false
+              }
+            }' > runtime-observed-output-122.json
+
+          cat runtime-observed-output-122.json
+
+          jq -e '
+            .github_actions_runtime_validation.fork_pr_used == true and
+            .github_actions_runtime_validation.fork_author_is_not_base_repo_collaborator == true and
+            .github_actions_runtime_validation.checkout_sha_equals_pr_head_sha == true and
+            .github_actions_runtime_validation.action_generated_github_comment_mcp_server == true and
+            .github_actions_runtime_validation.mcp_env_had_github_token == true and
+            .github_actions_runtime_validation.pr_controlled_bunfig_preload_executed == true and
+            .github_actions_runtime_validation.preload_saw_github_token_env == true and
+            .github_actions_runtime_validation.safe_marker_comment_created == true
+          ' runtime-observed-output-122.json
+
+      - name: Upload runtime evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: runtime-evidence-122
+          path: |
+            runtime-observed-output-122.json
+            pr-metadata-122.json
+            run-metadata-122.json
+            ${{ runner.temp }}/h1-preload-observed-122.json
+            ${{ runner.temp }}/h1-fake-claude-observed-122.json
+
